@@ -24,7 +24,7 @@ def post_process_mesh(mesh, cluster_to_keep=1000):
     Post-process a mesh to filter out floaters and disconnected parts
     """
     import copy
-    print("post processing the mesh to have {} clusterscluster_to_kep".format(cluster_to_keep))
+    print("post processing the mesh to have {} clusters to keep".format(cluster_to_keep))
     mesh_0 = copy.deepcopy(mesh)
     with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
             triangle_clusters, cluster_n_triangles, cluster_area = (mesh_0.cluster_connected_triangles())
@@ -41,6 +41,170 @@ def post_process_mesh(mesh, cluster_to_keep=1000):
     print("num vertices raw {}".format(len(mesh.vertices)))
     print("num vertices post {}".format(len(mesh_0.vertices)))
     return mesh_0
+
+
+def post_process_mesh_alpha(mesh, viewpoint_stack, alphamaps, depthmaps, alpha_threshold=0.5, min_view_ratio=0.5, depth_tolerance=0.1):
+    """
+    Post-process mesh by filtering vertices based on rendered alpha values and depth consistency.
+    Projects mesh vertices back to camera views and removes background points.
+
+    Args:
+        mesh: o3d.TriangleMesh - input mesh to filter
+        viewpoint_stack: list of camera viewpoints
+        alphamaps: list of alpha maps (tensors) corresponding to each viewpoint
+        depthmaps: list of depth maps (tensors) corresponding to each viewpoint
+        alpha_threshold: threshold for considering a point as foreground (default: 0.5)
+        min_view_ratio: minimum ratio of views where vertex should be foreground to keep it (default: 0.5)
+        depth_tolerance: relative depth tolerance for consistency check (default: 0.1 = 10%)
+
+    Returns:
+        filtered o3d.TriangleMesh
+    """
+    import copy
+    print(f"Alpha-based post processing: alpha_threshold={alpha_threshold}, min_view_ratio={min_view_ratio}, depth_tolerance={depth_tolerance}")
+
+    mesh_0 = copy.deepcopy(mesh)
+    vertices = np.asarray(mesh_0.vertices)
+    n_vertices = len(vertices)
+
+    if n_vertices == 0:
+        print("Warning: mesh has no vertices")
+        return mesh_0
+
+    # Convert vertices to torch tensor
+    vertices_torch = torch.from_numpy(vertices).float().cuda()
+
+    # Track how many views consider each vertex as foreground
+    foreground_count = np.zeros(n_vertices, dtype=np.int32)
+    total_valid_views = np.zeros(n_vertices, dtype=np.int32)
+
+    # Store alpha statistics for debugging
+    alpha_values_list = [[] for _ in range(n_vertices)]
+
+    print(f"Processing {n_vertices} vertices across {len(viewpoint_stack)} views...")
+
+    for i, viewpoint_cam in tqdm(enumerate(viewpoint_stack), total=len(viewpoint_stack), desc="Alpha filtering"):
+        # Get alpha and depth maps for this view
+        alpha = alphamaps[i]
+        depth = depthmaps[i]
+
+        if alpha.dim() == 3:
+            alpha = alpha[0]  # Remove channel dimension if present
+        if depth.dim() == 3:
+            depth = depth[0]  # Remove channel dimension if present
+
+        # Project vertices to camera space
+        vertices_homo = torch.cat([vertices_torch, torch.ones_like(vertices_torch[:, :1])], dim=-1)
+        projected = vertices_homo @ viewpoint_cam.full_proj_transform
+
+        # Perspective divide
+        z = projected[:, -1:]
+        pix_coords = projected[:, :2] / (projected[:, -1:] + 1e-7)
+
+        # Check which vertices project into valid image region
+        mask_in_view = ((pix_coords[:, 0] > -1.0) & (pix_coords[:, 0] < 1.0) &
+                        (pix_coords[:, 1] > -1.0) & (pix_coords[:, 1] < 1.0) &
+                        (z[:, 0] > 0))
+
+        if mask_in_view.sum() == 0:
+            continue
+
+        # Sample alpha values at projected coordinates
+        pix_coords_valid = pix_coords[mask_in_view].unsqueeze(0).unsqueeze(0)  # [1, 1, N, 2]
+        alpha_samples = torch.nn.functional.grid_sample(
+            alpha.cuda().float().unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+            pix_coords_valid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True
+        ).squeeze()  # [N]
+
+        # Sample depth values at projected coordinates
+        depth_samples = torch.nn.functional.grid_sample(
+            depth.cuda().float().unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+            pix_coords_valid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True
+        ).squeeze()  # [N]
+
+        # Get vertex depths in camera space
+        vertex_depths = z[mask_in_view].squeeze()
+
+        # Update counts
+        mask_in_view_np = mask_in_view.cpu().numpy()
+        total_valid_views[mask_in_view_np] += 1
+
+        # Check depth consistency: vertex depth should be close to rendered depth
+        depth_consistent = torch.abs(vertex_depths - depth_samples) < (depth_tolerance * depth_samples + 1e-3)
+
+        # A vertex is considered foreground if:
+        # 1. Alpha > threshold (visible in render)
+        # 2. Depth is consistent (vertex is at the rendered surface, not behind or in front)
+        # foreground_mask = ((alpha_samples > alpha_threshold) & depth_consistent).cpu().numpy()
+        # foreground_mask = depth_consistent.cpu().numpy()
+        foreground_mask = (alpha_samples > alpha_threshold).cpu().numpy()
+
+        # Store alpha values for debugging
+        valid_indices = np.where(mask_in_view_np)[0]
+        alpha_np = alpha_samples.cpu().numpy()
+        for idx, alpha_val in zip(valid_indices, alpha_np):
+            alpha_values_list[idx].append(float(alpha_val))
+
+        foreground_indices = valid_indices[foreground_mask]
+        foreground_count[foreground_indices] += 1
+
+    # Calculate foreground ratio for each vertex
+    foreground_ratio = np.zeros(n_vertices, dtype=np.float32)
+    valid_mask = total_valid_views > 0
+    foreground_ratio[valid_mask] = foreground_count[valid_mask] / total_valid_views[valid_mask]
+
+    # Keep vertices that are foreground in at least min_view_ratio of valid views
+    vertices_to_keep = foreground_ratio >= min_view_ratio
+
+    # Debug: print alpha statistics
+    alpha_means = []
+    for alpha_vals in alpha_values_list:
+        if len(alpha_vals) > 0:
+            alpha_means.append(np.mean(alpha_vals))
+    if len(alpha_means) > 0:
+        print(f"Alpha value statistics - Mean: {np.mean(alpha_means):.3f}, Std: {np.std(alpha_means):.3f}, Min: {np.min(alpha_means):.3f}, Max: {np.max(alpha_means):.3f}")
+
+    print(f"Foreground ratio statistics - Mean: {foreground_ratio[valid_mask].mean():.3f}, Std: {foreground_ratio[valid_mask].std():.3f}")
+    print(f"Vertices before alpha filtering: {n_vertices}")
+    print(f"Vertices to keep: {vertices_to_keep.sum()}")
+    print(f"Vertices to remove: {(~vertices_to_keep).sum()}")
+
+    # Remove vertices and associated triangles
+    triangles = np.asarray(mesh_0.triangles)
+
+    # Create vertex mapping (old index -> new index)
+    vertex_map = np.full(n_vertices, -1, dtype=np.int32)
+    vertex_map[vertices_to_keep] = np.arange(vertices_to_keep.sum())
+
+    # Keep only triangles where all vertices are kept
+    triangles_to_keep = vertices_to_keep[triangles].all(axis=1)
+    new_triangles = vertex_map[triangles[triangles_to_keep]]
+
+    # Create new mesh
+    new_vertices = vertices[vertices_to_keep]
+    mesh_filtered = o3d.geometry.TriangleMesh()
+    mesh_filtered.vertices = o3d.utility.Vector3dVector(new_vertices)
+    mesh_filtered.triangles = o3d.utility.Vector3iVector(new_triangles)
+
+    # Copy vertex colors if they exist
+    if mesh_0.has_vertex_colors():
+        vertex_colors = np.asarray(mesh_0.vertex_colors)
+        mesh_filtered.vertex_colors = o3d.utility.Vector3dVector(vertex_colors[vertices_to_keep])
+
+    # Clean up
+    mesh_filtered.remove_degenerate_triangles()
+    mesh_filtered.remove_unreferenced_vertices()
+
+    print(f"Final vertex count: {len(mesh_filtered.vertices)}")
+    print(f"Final triangle count: {len(mesh_filtered.triangles)}")
+
+    return mesh_filtered
 
 def to_cam_open3d(viewpoint_stack):
     camera_traj = []
@@ -90,7 +254,7 @@ class GaussianExtractor(object):
     @torch.no_grad()
     def clean(self):
         self.depthmaps = []
-        # self.alphamaps = []
+        self.alphamaps = []
         self.rgbmaps = []
         # self.normals = []
         # self.depth_normals = []
@@ -107,6 +271,7 @@ class GaussianExtractor(object):
             render_pkg = self.render(viewpoint_cam, self.gaussians)
             rgb = render_pkg['render']
             alpha = render_pkg['rend_alpha']
+            gt_alpha_mask = viewpoint_cam.gt_alpha_mask
             normal = torch.nn.functional.normalize(render_pkg['rend_normal'], dim=0)
             depth = render_pkg['surf_depth']*viewpoint_cam.gt_alpha_mask
             # print("Mash sum:", viewpoint_cam.gt_alpha_mask.sum())
@@ -114,6 +279,7 @@ class GaussianExtractor(object):
             self.rgbmaps.append(rgb.cpu())
             self.depthmaps.append(depth.cpu())
             # self.alphamaps.append(alpha.cpu())
+            self.alphamaps.append(gt_alpha_mask.cpu())
             # self.normals.append(normal.cpu())
             # self.depth_normals.append(depth_normal.cpu())
 

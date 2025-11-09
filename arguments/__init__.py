@@ -55,6 +55,8 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
+        self.train_transforms = "transforms_train.json"
+        self.test_transforms = "transforms_test.json"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -76,7 +78,7 @@ class OptimizationParams(ParamGroup):
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 50_000
+        self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005

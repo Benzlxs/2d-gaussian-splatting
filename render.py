@@ -20,7 +20,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
-from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh
+from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh, post_process_mesh_alpha
 from utils.render_utils import generate_path, create_videos
 
 import open3d as o3d
@@ -41,7 +41,11 @@ if __name__ == "__main__":
     parser.add_argument("--sdf_trunc", default=-1.0, type=float, help='Mesh: truncation value for TSDF')
     parser.add_argument("--num_cluster", default=50, type=int, help='Mesh: number of connected clusters to export')
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
-    parser.add_argument("--mesh_res", default=512, type=int, help='Mesh: resolution for unbounded mesh extraction')
+    parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
+    parser.add_argument("--use_alpha_filter", action="store_true", help='Mesh: use alpha-based filtering to remove background points')
+    parser.add_argument("--alpha_threshold", default=0.5, type=float, help='Mesh: threshold for alpha-based filtering')
+    parser.add_argument("--min_view_ratio", default=0.6, type=float, help='Mesh: minimum ratio of views where vertex should be foreground')
+    parser.add_argument("--depth_tolerance", default=0.5, type=float, help='Mesh: relative depth tolerance for alpha filtering (default: 0.1 = 10%)')
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
@@ -102,7 +106,23 @@ if __name__ == "__main__":
 
         o3d.io.write_triangle_mesh(os.path.join(train_dir, name), mesh)
         print("mesh saved at {}".format(os.path.join(train_dir, name)))
+
         # post-process the mesh and save, saving the largest N clusters
         mesh_post = post_process_mesh(mesh, cluster_to_keep=args.num_cluster)
         o3d.io.write_triangle_mesh(os.path.join(train_dir, name.replace('.ply', '_post.ply')), mesh_post)
         print("mesh post processed saved at {}".format(os.path.join(train_dir, name.replace('.ply', '_post.ply'))))
+
+        # apply alpha-based filtering if requested
+        # if args.use_alpha_filter:
+        print("Applying alpha-based filtering...")
+        mesh_alpha = post_process_mesh_alpha(
+            mesh_post,
+            gaussExtractor.viewpoint_stack,
+            gaussExtractor.alphamaps,
+            gaussExtractor.depthmaps,
+            alpha_threshold=args.alpha_threshold,
+            min_view_ratio=args.min_view_ratio,
+            depth_tolerance=args.depth_tolerance
+        )
+        o3d.io.write_triangle_mesh(os.path.join(train_dir, name.replace('.ply', '_alpha.ply')), mesh_alpha)
+        print("alpha-filtered mesh saved at {}".format(os.path.join(train_dir, name.replace('.ply', '_alpha.ply'))))

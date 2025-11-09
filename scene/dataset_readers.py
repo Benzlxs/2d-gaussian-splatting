@@ -182,21 +182,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
-            if False:
-                cam_name = os.path.join(path, frame["file_path"])
-                cam_ids = int(frame["file_path"].split(".")[0])
-                fovx = frame["camera_angle_x"]
-                # if cam_ids not in [8, 97, 136, 38, 35, 5, 82, 36, 19, 147]:
-                # if cam_ids not in [132, 25, 6, 99, 110, 8, 148, 50, 69, 96]:
-                if cam_ids not in [9, 127, 42, 133, 15, 146, 35, 40, 38, 43]:
-                    continue
-            else:
-                cam_name = os.path.join(path, frame["file_path"])
-
-            # fovx = frame["camera_angle_x"]
+            cam_name = os.path.join(path, frame["file_path"])
+            fovx = frame["camera_angle_x"]
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
@@ -230,12 +219,13 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", train_transforms="transforms_train.json", test_transforms="transforms_test.json"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, train_transforms, white_background, extension)
+    print("Camera length:", len(train_cam_infos))
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
-
+    test_cam_infos = readCamerasFromTransforms(path, test_transforms, white_background, extension)
+    print("Camera length:", len(test_cam_infos))
     if not eval:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
